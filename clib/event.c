@@ -1,12 +1,3 @@
-/*
-    事件分发的服务类型有两种，一种是会被创建很多实例的(玩家agent)，一种是只会被创建一个实例的(或者少量-主从模式)
-    多实例服务暂称为multi server， 单实例服务为single server
-    事件分发规则限制：
-    multi server分发事件一般不希望被其他实例服务收到，所以它仅分发到 自身和其他single server
-    single server分发事件可以被所有的服务收到
-    实现使用一个interest列表存放single server，用来区分这两种服务类型，所以single server在使用时需要先注册到interest列表
-*/
-
 #include <stdint.h>
 #include <string.h>
 #include <assert.h>
