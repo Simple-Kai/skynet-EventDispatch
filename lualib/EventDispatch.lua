@@ -1,35 +1,35 @@
 require "skynet.manager"
 local skynet = require "skynet"
 
-local EventDispatcher = require "event"
+local EventCore = require "event"
 local EEvent = require "EventDefine"
 
 local CMD = {}
 
 function CMD.register(iSource)
-	EventDispatcher.register(iSource)
+	EventCore.register(iSource)
 end
 
 function CMD.add(iSource, iEventType, ...)
-	EventDispatcher.add(iEventType, iSource, skynet.pack("event", ...))
+	EventCore.add(iEventType, iSource, skynet.pack("event", ...))
+end
+
+function CMD.del(iSource, iEventType, ...)
+	EventCore.del(iEventType, iSource, skynet.pack("event", ...))
 end
 
 function CMD.dispatch(iSource, iEventType, param)
-	EventDispatcher.dispatch(iEventType, iSource, skynet.pack(param))
+	EventCore.dispatch(iEventType, iSource, skynet.pack(param))
 end
 
 function CMD.clear(iSource)
-	print("event sum:", EventDispatcher.sum(0))
-	EventDispatcher.clear(iSource)
-	print("event sum:", EventDispatcher.sum(0))
+	print("event sum:", EventCore.sum())
+	EventCore.clear(iSource)
+	print("event sum:", EventCore.sum())
 end
 
 local function init()
-	local n = 0
-	for k, v in pairs(EEvent) do
-		n = n + 1
-	end
-	EventDispatcher.init(n)
+	EventCore.init(100)
 end
 
 skynet.start(function()
@@ -42,6 +42,6 @@ skynet.start(function()
 		end
 	end)
 	init()
-	skynet.register(".EventDispatcher")
+	skynet.register(".Event")
 end)
 

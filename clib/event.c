@@ -10,7 +10,7 @@
 
 
 #define EVENT_POOL_DEFAULT_NUM 200  
-#define MAX_EVENT_NUM_NODE 1 << 7 
+#define NODE_EVENT_LIMIT (1 << 8)
 #define CHECK_INIT(e) assert(e != 0);
 
 
@@ -22,7 +22,7 @@ struct event_message{
 
 struct event_server_node{
 	struct event_server_node *next;
-	uint32_t handle;  //服务fd
+	uint32_t handle;
 	struct event_message *head;
 	struct event_message *tail;
     uint32_t event_count;
@@ -41,7 +41,7 @@ create_event_message(void * data, size_t sz) {
     struct event_message* em = skynet_malloc(sizeof(struct event_message));
     memset(em,0,sizeof(struct event_message));
     em->next = NULL;
-    em->data = data;
+    em->data = data;  // userdata(skynet.pack), no copy
     em->sz = sz;
     return em;
 }
@@ -69,8 +69,9 @@ create_event_server_node(uint32_t handle) {
 void destroy_event_server_node(struct event_server_node* esn) {
     if (esn) {
         struct event_message* em = esn->head;
+        struct event_message* next = NULL;
         while (em) {
-            struct event_message* next = em->next;
+            next = em->next;
             destroy_event_message(em);
             em = next;
         }
@@ -95,8 +96,9 @@ void destroy_event_storage(struct event_storage* es) {
     if (es) {
         for (int i = 0; i < es->slot_size; i++) {
             struct event_server_node* esn = es->slot[i];
+            struct event_server_node* next = NULL;
             while (esn) {
-                struct event_server_node* next = esn->next;
+                next = esn->next;
                 destroy_event_server_node(esn);
                 esn = next;
             }
@@ -109,14 +111,16 @@ void destroy_event_storage(struct event_storage* es) {
 
 static void
 add_massage(struct event_server_node* esn, void *data, size_t sz){
-    if (esn->event_count == MAX_EVENT_NUM_NODE){
-        skynet_error(NULL, "add massage failed! max add %d of same events!", MAX_EVENT_NUM_NODE);
+    struct event_message* em = create_event_message(data, sz);
+    if (esn->event_count == NODE_EVENT_LIMIT){
+        destroy_event_message(em);
+        skynet_error(NULL, "add massage failed! max add %d of same events!", NODE_EVENT_LIMIT);
         return;
     }
-    struct event_message* em = create_event_message(data, sz);
     if (!esn->head) {
         esn->head = esn->tail = em;
-    } else {
+    } 
+    else {
         esn->tail->next = em;
         esn->tail = em;
     }
@@ -151,6 +155,33 @@ void add_event_listen(struct event_storage* es, uint32_t event_type, uint32_t ha
     add_massage(esn, data, sz);
 }
 
+void del_event_listen(struct event_storage* es, uint32_t event_type, uint32_t handle, const void *data, size_t size){
+    CHECK_INIT(es)
+    struct event_server_node* curr = get_event_server_node(es, event_type);
+    while (curr && curr->handle != handle) {
+        curr = curr->next;
+    }
+    if (!curr) return;
+
+    struct event_message* em = curr->head;
+    struct event_message* prev = NULL;
+    while (em) {
+        if (em->sz == size && memcmp(em->data, data, size) == 0){
+            if (prev == NULL){
+                curr->head = em->next;
+            } 
+            else {
+                prev->next = em->next;
+            }
+            destroy_event_message(em);
+            --curr->event_count;
+            break;
+        }
+        prev = em;
+        em = em->next;
+    }
+}
+
 void delete_event_server_node(struct event_storage* es, uint32_t event_type, uint32_t handle) {
     CHECK_INIT(es)
     struct event_server_node* esn_head = get_event_server_node(es, event_type);
@@ -160,7 +191,8 @@ void delete_event_server_node(struct event_storage* es, uint32_t event_type, uin
         if (curr->handle == handle) {
             if (prev == NULL) {
                 es->slot[event_type - 1] = curr->next;
-            } else {
+            }
+            else {
                 prev->next = curr->next;
             }
             destroy_event_server_node(curr);
@@ -277,6 +309,16 @@ static int ladd_event_listen(lua_State* L) {
     return 0;
 }
 
+static int ldel_event_listen(lua_State* L) {
+    uint32_t event_type = luaL_checkinteger(L, 1);
+    uint32_t handle = luaL_checkinteger(L, 2);
+    void * msg = lua_touserdata(L, 3);
+    int sz = luaL_checkinteger(L, 4);
+    del_event_listen(E, event_type, handle, msg, sz);
+    skynet_free(msg);
+    return 0;
+}
+
 static int ldispatch_event(lua_State* L) {
     uint32_t event_type = luaL_checkinteger(L, 1);
     uint32_t handle = luaL_checkinteger(L, 2);
@@ -294,11 +336,16 @@ static int lclear_event(lua_State* L) {
 }
 
 static int lget_event_sum(lua_State* L) {
-    uint32_t event_type = luaL_checkinteger(L, 1);
+    uint32_t event_type = 0;
+    if (lua_gettop(L) != 0){
+        event_type = luaL_checkinteger(L, 1);
+    }
     uint32_t sum = get_event_sum(E, event_type);
     lua_pushinteger(L, sum);
     return 1;
 }
+
+
 
 int luaopen_event(lua_State* L) {
     luaL_checkversion(L);
@@ -312,6 +359,7 @@ int luaopen_event(lua_State* L) {
         {"init", levent_storage_init},
         {"register", lregister_interest_list},
         {"add", ladd_event_listen},
+        {"del", ldel_event_listen},
         {"sum", lget_event_sum},
         {"clear", lclear_event},
         { NULL, NULL },
