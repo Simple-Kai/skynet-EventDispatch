@@ -6,13 +6,13 @@
 
 #include "skynet.h"
 #include "skynet_malloc.h"
+#include "atomic.h"
+#include "spinlock.h"
 #include "interest_list.h"
 
+uint32_t skynet_context_handle(struct skynet_context *);
 
-#define EVENT_POOL_DEFAULT_NUM 200  
-#define NODE_EVENT_LIMIT (1 << 8)
-#define CHECK_INIT(e) assert(e != 0);
-
+#define EVENT_STORAGE_DEFAULT_NUM 10000 
 
 struct event_message{
 	struct event_message *next;
@@ -25,18 +25,18 @@ struct event_server_node{
 	uint32_t handle;
 	struct event_message *head;
 	struct event_message *tail;
-    uint32_t event_count;
+    ATOM_SIZET event_count;
 };
 
 struct event_storage{
 	uint32_t slot_size;
 	struct event_server_node **slot;
     struct interest_list *interest_list;
+    struct spinlock lock;
+    ATOM_ULONG ref;
 };
 
-static struct event_storage *E = NULL;
-
-struct event_message* 
+static struct event_message* 
 create_event_message(void * data, size_t sz) {
     struct event_message* em = skynet_malloc(sizeof(struct event_message));
     memset(em,0,sizeof(struct event_message));
@@ -46,7 +46,8 @@ create_event_message(void * data, size_t sz) {
     return em;
 }
 
-void destroy_event_message(struct event_message* em) {
+static void 
+destroy_event_message(struct event_message* em) {
     if (em) {
         skynet_free(em->data);
         em->data = NULL;
@@ -54,7 +55,7 @@ void destroy_event_message(struct event_message* em) {
     }
 }
 
-struct event_server_node* 
+static struct event_server_node* 
 create_event_server_node(uint32_t handle) {
     struct event_server_node* esn = skynet_malloc(sizeof(struct event_server_node));
     memset(esn,0,sizeof(struct event_server_node));
@@ -62,11 +63,12 @@ create_event_server_node(uint32_t handle) {
     esn->handle = handle;
     esn->head = NULL;
     esn->tail = NULL;
-    esn->event_count = 0;
+    ATOM_INIT(&esn->event_count, 0);
     return esn;
 }
 
-void destroy_event_server_node(struct event_server_node* esn) {
+static void 
+destroy_event_server_node(struct event_server_node* esn) {
     if (esn) {
         struct event_message* em = esn->head;
         struct event_message* next = NULL;
@@ -79,7 +81,7 @@ void destroy_event_server_node(struct event_server_node* esn) {
     }
 }
 
-struct event_storage* 
+static struct event_storage* 
 create_event_storage(uint32_t slot_size) {
     struct event_storage* es = skynet_malloc(sizeof(struct event_storage));
     memset(es,0,sizeof(struct event_storage));
@@ -89,10 +91,13 @@ create_event_storage(uint32_t slot_size) {
         es->slot[i] = NULL;
     }
     es->interest_list = create_interest_list(10);
+    ATOM_INIT(&es->ref , 0);
+    SPIN_INIT(es)
     return es;
 }
 
-void destroy_event_storage(struct event_storage* es) {
+static void 
+destroy_event_storage(struct event_storage* es) {
     if (es) {
         for (int i = 0; i < es->slot_size; i++) {
             struct event_server_node* esn = es->slot[i];
@@ -103,6 +108,7 @@ void destroy_event_storage(struct event_storage* es) {
                 esn = next;
             }
         }
+        SPIN_DESTROY(es)
         destroy_interest_list(es->interest_list);
         skynet_free(es->slot);
         skynet_free(es);
@@ -112,11 +118,6 @@ void destroy_event_storage(struct event_storage* es) {
 static void
 add_massage(struct event_server_node* esn, void *data, size_t sz){
     struct event_message* em = create_event_message(data, sz);
-    if (esn->event_count == NODE_EVENT_LIMIT){
-        destroy_event_message(em);
-        skynet_error(NULL, "add massage failed! max add %d of same events!", NODE_EVENT_LIMIT);
-        return;
-    }
     if (!esn->head) {
         esn->head = esn->tail = em;
     } 
@@ -124,7 +125,7 @@ add_massage(struct event_server_node* esn, void *data, size_t sz){
         esn->tail->next = em;
         esn->tail = em;
     }
-    ++esn->event_count;
+    ATOM_FINC(&esn->event_count);
 }
 
 static struct event_server_node* 
@@ -133,13 +134,12 @@ get_event_server_node(struct event_storage* es, uint32_t event_type){
     return es->slot[index];
 }
 
-void add_event_listen(struct event_storage* es, uint32_t event_type, uint32_t handle, void *data, size_t sz) {
-    CHECK_INIT(es)
+int add_event_listen(struct event_storage* es, uint32_t event_type, uint32_t handle, void *data, size_t sz) {
 	if(event_type > es->slot_size){
-        skynet_error(NULL, "add failed! event = %u event_type in (1-200)", event_type);
-        return;
+        skynet_error(NULL, "add failed! event = %u event_type in [1-%u]", event_type, es->slot_size);
+        return -1;
 	}
-
+    SPIN_LOCK(es)
     struct event_server_node* esn_head = get_event_server_node(es, event_type);
     struct event_server_node* esn = esn_head;
     while (esn && esn->handle != handle) {
@@ -149,41 +149,43 @@ void add_event_listen(struct event_storage* es, uint32_t event_type, uint32_t ha
     if (esn == NULL) {
         esn = create_event_server_node(handle);
         esn->next = esn_head;
-        esn_head = esn;
-        es->slot[event_type - 1] = esn_head;
+        es->slot[event_type - 1] = esn;
     }
     add_massage(esn, data, sz);
+    SPIN_UNLOCK(es)
+    return 0;
 }
 
 void del_event_listen(struct event_storage* es, uint32_t event_type, uint32_t handle, const void *data, size_t size){
-    CHECK_INIT(es)
+    SPIN_LOCK(es)
     struct event_server_node* curr = get_event_server_node(es, event_type);
     while (curr && curr->handle != handle) {
         curr = curr->next;
     }
-    if (!curr) return;
-
-    struct event_message* em = curr->head;
-    struct event_message* prev = NULL;
-    while (em) {
-        if (em->sz == size && memcmp(em->data, data, size) == 0){
-            if (prev == NULL){
-                curr->head = em->next;
-            } 
-            else {
-                prev->next = em->next;
+    if (curr) {
+        struct event_message* em = curr->head;
+        struct event_message* prev = NULL;
+        while (em) {
+            if (em->sz == size && memcmp(em->data, data, size) == 0){
+                if (prev == NULL){
+                    curr->head = em->next;
+                } 
+                else {
+                    prev->next = em->next;
+                }
+                destroy_event_message(em);
+                ATOM_FDEC(&curr->event_count);
+                break;
             }
-            destroy_event_message(em);
-            --curr->event_count;
-            break;
+            prev = em;
+            em = em->next;
         }
-        prev = em;
-        em = em->next;
     }
+    SPIN_UNLOCK(es)
 }
 
-void delete_event_server_node(struct event_storage* es, uint32_t event_type, uint32_t handle) {
-    CHECK_INIT(es)
+static void 
+delete_event_server_node(struct event_storage* es, uint32_t event_type, uint32_t handle) {
     struct event_server_node* esn_head = get_event_server_node(es, event_type);
     struct event_server_node* prev = NULL;
     struct event_server_node* curr = esn_head;
@@ -203,14 +205,16 @@ void delete_event_server_node(struct event_storage* es, uint32_t event_type, uin
     }
 }
 
-void delete_event_server_node_all(struct event_storage* es, uint32_t handle){
+void clear_event_server_node(struct event_storage* es, uint32_t handle){
+    SPIN_LOCK(es)
     for (int i = 1; i <= es->slot_size; ++i) {
         delete_event_server_node(es, i, handle);
     }
+    SPIN_UNLOCK(es)
 }
 
 static void 
-merge_data(void *front , size_t front_sz, void *back, size_t back_sz, void ** p_buffer, size_t *p_buff_sz){
+merge_data(const void *front , size_t front_sz, const void *back, size_t back_sz, void ** p_buffer, size_t *p_buff_sz){
     size_t new_sz = front_sz + back_sz;
     *p_buffer = skynet_malloc(new_sz);
     memcpy(*p_buffer, front, front_sz);
@@ -221,10 +225,13 @@ merge_data(void *front , size_t front_sz, void *back, size_t back_sz, void ** p_
 static void 
 dispatch_all_by_node(struct event_server_node* esn, struct skynet_context *context, uint32_t source, void *param, size_t param_sz){
     struct event_message* em = esn->head;
+    void *buffer = NULL;
+    size_t buff_sz;
+    int type;
     while (em) {
-        void *buffer = em->data;
-        size_t buff_sz = em->sz;
-        int type = PTYPE_RESERVED_LUA;
+        buffer = em->data;
+        buff_sz = em->sz;
+        type = PTYPE_RESERVED_LUA;
         if (param_sz != 0){
             merge_data(buffer, buff_sz, param, param_sz, &buffer, &buff_sz);
             type |= PTYPE_TAG_DONTCOPY;
@@ -235,7 +242,7 @@ dispatch_all_by_node(struct event_server_node* esn, struct skynet_context *conte
 }
 
 void dispatch_event(struct event_storage* es, uint32_t event_type, uint32_t source, struct skynet_context *ctx, void *param, size_t sz){
-    CHECK_INIT(es)
+    SPIN_LOCK(es)
     struct event_server_node* curr = get_event_server_node(es, event_type);
     int in_interest = 0;
     if (find_interest_list(es->interest_list, source))
@@ -247,15 +254,16 @@ void dispatch_event(struct event_storage* es, uint32_t event_type, uint32_t sour
         }
         curr = curr->next;
     }   
-
+    SPIN_UNLOCK(es)
     if (param){
         skynet_free(param);
-    }     
+    }
 }
 
-void register_interest_list(struct event_storage* es, uint32_t handle) {
-    CHECK_INIT(es)
-    add_interest_list(es->interest_list, handle);
+void add_interest_list(struct event_storage* es, uint32_t handle) {
+    SPIN_LOCK(es)
+    insert_interest_list(es->interest_list, handle);
+    SPIN_UNLOCK(es)
 }
 
 uint32_t get_event_sum(struct event_storage* es, uint32_t event_type){
@@ -265,7 +273,7 @@ uint32_t get_event_sum(struct event_storage* es, uint32_t event_type){
         for (int i = 0; i < es->slot_size; ++i) {
             node = es->slot[i];
             while (node) {
-                sum += node->event_count;
+                sum += ATOM_LOAD(&node->event_count);
                 node = node->next;
             } 
         }
@@ -273,69 +281,102 @@ uint32_t get_event_sum(struct event_storage* es, uint32_t event_type){
     else{
         node = get_event_server_node(es, event_type);
         while (node) {
-            sum += node->event_count;
+            sum += ATOM_LOAD(&node->event_count);
             node = node->next;
         }   
     }
-    node = NULL;
     return sum;
 }
 
 
-void event_storage_init(uint32_t n){
-	assert(E == NULL);
-	E = create_event_storage(n>0?n:EVENT_POOL_DEFAULT_NUM);
+static struct event_storage *E = NULL; //single instance
+static struct spinlock opening = {0};
+
+static void
+open_event_core(int n) {
+    if (E == NULL) {
+        spinlock_lock(&opening);
+        if (E == NULL) {
+            E = create_event_storage(n>0?n:EVENT_STORAGE_DEFAULT_NUM); //10000 ptr use memory 85kb
+        }
+        spinlock_unlock(&opening);
+    }
+    ATOM_FINC(&E->ref);
 }
 
+static int
+close_event_core() {
+    if (E != NULL && ATOM_FDEC(&E->ref) == 1) {
+        destroy_event_storage(E);
+        E = NULL;
+        return 0;
+    }
+    return -1;
+}
+
+
 //------------lua接口-------------------
-static int levent_storage_init(lua_State* L) {
-    uint32_t n = luaL_checkinteger(L, 1);
-    event_storage_init(n);
+#define CHECK_EVENTCORE_DUMP(L, e) if (!e) {luaL_error(L, "add event error!");}
+#define CONTEXT_HANDLE(L) skynet_context_handle((struct skynet_context *)lua_touserdata(L, lua_upvalueindex(1)))
+
+static int levent_open(lua_State* L) {
+    int n = lua_tointeger(L, 1);
+    open_event_core(n);
     return 0;
 }
 
-static int lregister_interest_list(lua_State *L) {
-    uint32_t handle = luaL_checkinteger(L, 1);
-    register_interest_list(E, handle);
+static int levent_close(lua_State* L) {
+    if (close_event_core()) {
+        uint32_t handle = lua_tointeger(L, lua_upvalueindex(1));
+        clear_event_server_node(E, handle);
+    }
+    return 0;
+}
+
+static int ladd_interest(lua_State *L) {
+    CHECK_EVENTCORE_DUMP(L, E)
+    uint32_t handle = CONTEXT_HANDLE(L);
+    add_interest_list(E, handle);
     return 0;
 }
 
 static int ladd_event_listen(lua_State* L) {
+    CHECK_EVENTCORE_DUMP(L, E)
     uint32_t event_type = luaL_checkinteger(L, 1);
-    uint32_t handle = luaL_checkinteger(L, 2);
-    void * msg = lua_touserdata(L, 3);
-    int sz = luaL_checkinteger(L, 4);
-    add_event_listen(E, event_type, handle, msg, sz);
+    void * msg = lua_touserdata(L, 2);
+    int sz = luaL_checkinteger(L, 3);
+    uint32_t handle = CONTEXT_HANDLE(L);
+    if (add_event_listen(E, event_type, handle, msg, sz)) {
+        skynet_free(msg);
+        luaL_error(L, "add event error!");
+    }
     return 0;
 }
 
 static int ldel_event_listen(lua_State* L) {
+    CHECK_EVENTCORE_DUMP(L, E)
     uint32_t event_type = luaL_checkinteger(L, 1);
-    uint32_t handle = luaL_checkinteger(L, 2);
-    void * msg = lua_touserdata(L, 3);
-    int sz = luaL_checkinteger(L, 4);
+    void * msg = lua_touserdata(L, 2);
+    int sz = luaL_checkinteger(L, 3);
+    uint32_t handle = CONTEXT_HANDLE(L);
     del_event_listen(E, event_type, handle, msg, sz);
     skynet_free(msg);
     return 0;
 }
 
-static int ldispatch_event(lua_State* L) {
+static int ldispatch(lua_State* L) {
+    CHECK_EVENTCORE_DUMP(L, E)
     uint32_t event_type = luaL_checkinteger(L, 1);
-    uint32_t handle = luaL_checkinteger(L, 2);
-    void *param = lua_touserdata(L, 3);
-    size_t sz = luaL_checkinteger(L, 4);
+    void *param = lua_touserdata(L, 2);
+    size_t sz = luaL_checkinteger(L, 3);
     struct skynet_context *ctx = lua_touserdata(L, lua_upvalueindex(1));
+    uint32_t handle = skynet_context_handle(ctx);
     dispatch_event(E, event_type, handle, ctx, param, sz);
     return 0;
 }
 
-static int lclear_event(lua_State* L) {
-    uint32_t handle = luaL_checkinteger(L, 1);
-    delete_event_server_node_all(E, handle);
-    return 0;
-}
-
 static int lget_event_sum(lua_State* L) {
+    CHECK_EVENTCORE_DUMP(L, E)
     uint32_t event_type = 0;
     if (lua_gettop(L) != 0){
         event_type = luaL_checkinteger(L, 1);
@@ -347,32 +388,41 @@ static int lget_event_sum(lua_State* L) {
 
 
 
-int luaopen_event(lua_State* L) {
+int luaopen_eventcore(lua_State* L) {
     luaL_checkversion(L);
 
+    lua_pushcfunction(L, levent_open);
+    lua_call(L, 0, 0);
+
     luaL_Reg l[] = {
-        {"dispatch", ldispatch_event},
+        {"register", ladd_interest},
+        {"add", ladd_event_listen},
+        {"del", ldel_event_listen},
+        {"dispatch", ldispatch},
         { NULL, NULL },
     };
 
     luaL_Reg l2[] = {
-        {"init", levent_storage_init},
-        {"register", lregister_interest_list},
-        {"add", ladd_event_listen},
-        {"del", ldel_event_listen},
         {"sum", lget_event_sum},
-        {"clear", lclear_event},
         { NULL, NULL },
     };
 
     lua_createtable(L, 0, sizeof(l)/sizeof(l[0]) + sizeof(l2)/sizeof(l2[0]) -2);
     lua_getfield(L, LUA_REGISTRYINDEX, "skynet_context");
-    struct skynet_context *ctx = lua_touserdata(L,-1);
+    struct skynet_context *ctx = lua_touserdata(L, -1);
     if (ctx == NULL) {
         return luaL_error(L, "Init skynet context first");
     }
 
     luaL_setfuncs(L,l,1);
     luaL_setfuncs(L,l2,0);
+
+    lua_createtable(L, 0, 1);
+    lua_pushstring(L, "__gc");
+    lua_pushinteger(L, skynet_context_handle(ctx));
+    lua_pushcclosure(L, levent_close, 1);
+    lua_rawset(L, -3);
+    lua_setmetatable(L, -2);
+
     return 1;
 }

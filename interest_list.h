@@ -15,7 +15,7 @@ struct interest_list{
 
 struct interest_list* create_interest_list(uint32_t size);
 void destroy_interest_list(struct interest_list *list);
-void add_interest_list(struct interest_list *list, uint32_t handle);
+void insert_interest_list(struct interest_list *list, uint32_t handle);
 uint32_t find_interest_list(struct interest_list *list, uint32_t handle);
 
 

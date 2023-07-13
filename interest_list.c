@@ -18,7 +18,7 @@ void destroy_interest_list(struct interest_list *list) {
     skynet_free(list);    
 }
 
-void add_interest_list(struct interest_list *list, uint32_t handle) {
+void insert_interest_list(struct interest_list *list, uint32_t handle) {
     if (list->count == 0) {
         list->arr[0] = handle;
     }else{
